@@ -1,8 +1,6 @@
-cupy==10.5.0
-cupy_cuda90==7.7.0
-matplotlib==3.5.1
-numpy==1.18.5
-opencv_python==4.2.0.34
-Pillow==9.1.1
-torch==1.8.1
-torchvision==0.9.1
+matplotlib==3.8.3
+numpy==1.26.4
+opencv-python==4.7.0.72
+pillow==10.2.0
+torch==2.5.0
+torchvision==0.20.0

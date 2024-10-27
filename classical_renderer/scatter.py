@@ -4,117 +4,91 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import cupy
 import re
 
-kernel_Render_updateOutput = '''
+import numpy as np
+import mlx.core as mx
 
-    extern "C" __global__ void kernel_Render_updateOutput(
-        const int n,
-        const float* image,          // original image
-        const float* defocus,        // signed defocus map
-        int* defocusDilate,          // signed defocus map after dilating
-        float* bokehCum,             // cumulative bokeh image
-        float* weightCum             // cumulative weight map
-    )
-    {
-        for (int intIndex = (blockIdx.x * blockDim.x) + threadIdx.x; intIndex < n; intIndex += blockDim.x * gridDim.x) {
-            const int intN = ( intIndex / SIZE_3(weightCum) / SIZE_2(weightCum) / SIZE_1(weightCum) ) % SIZE_0(weightCum);
-            // const int intC = ( intIndex / SIZE_3(weightCum) / SIZE_2(weightCum)                     ) % SIZE_1(weightCum);
-            const int intY = ( intIndex / SIZE_3(weightCum)                                         ) % SIZE_2(weightCum);
-            const int intX = ( intIndex                                                             ) % SIZE_3(weightCum);
+def render_update_output(imageMx, defocus):
+    assert imageMx.ndim == 4, "`image` must be 4D."
+    assert defocus.ndim == 4, "`defocus` must be 4D."
 
-            float fltDefocus = VALUE_4(defocus, intN, 0, intY, intX);
-            float fltRadius = fabsf(fltDefocus);
+    assert imageMx.shape[2:4] == defocus.shape[2:4], "`image` and `defocus` must have same resolution"
 
-            for (int intDeltaY = -(int)(fltRadius)-1; intDeltaY <= (int)(fltRadius)+1; ++intDeltaY) {
-                for (int intDeltaX = -(int)(fltRadius)-1; intDeltaX <= (int)(fltRadius)+1; ++intDeltaX) {
+    # n, channels, h, w = image.shape
 
-                    int intNeighborY = intY + intDeltaY;
-                    int intNeighborX = intX + intDeltaX;
+    source = """
+    uint elem = thread_position_in_grid.x;
 
-                    if ((intNeighborY >= 0) && (intNeighborY < SIZE_2(bokehCum)) && (intNeighborX >= 0) && (intNeighborX < SIZE_3(bokehCum))) {
-                        float fltDist = sqrtf((float)(intDeltaY)*(float)(intDeltaY) + (float)(intDeltaX)*(float)(intDeltaX));
-                        float fltWeight = (0.5 + 0.5 * tanhf(4 * (fltRadius - fltDist))) / (fltRadius * fltRadius + 0.2);
-                        if (fltRadius >= fltDist) {
-                            atomicMax(&defocusDilate[OFFSET_4(defocusDilate, intN, 0, intNeighborY, intNeighborX)], int(fltDefocus));
-                        }
-                        atomicAdd(&weightCum[OFFSET_4(weightCum, intN, 0, intNeighborY, intNeighborX)], fltWeight);
-                        atomicAdd(&bokehCum[OFFSET_4(bokehCum, intN, 0, intNeighborY, intNeighborX)], fltWeight * VALUE_4(image, intN, 0, intY, intX));
-                        atomicAdd(&bokehCum[OFFSET_4(bokehCum, intN, 1, intNeighborY, intNeighborX)], fltWeight * VALUE_4(image, intN, 1, intY, intX));
-                        atomicAdd(&bokehCum[OFFSET_4(bokehCum, intN, 2, intNeighborY, intNeighborX)], fltWeight * VALUE_4(image, intN, 2, intY, intX));
-                    }
+    int N = image_shape[0];
+    int C = image_shape[1];
+    int H = image_shape[2];
+    int W = image_shape[3];
+
+    int n = (elem / C / W / H) % N;
+    int y = (elem / C / W) % H;
+    int x = (elem / C) % W;
+
+    T fltDefocus = defocus[n * W * H * C + 0 * W * H + y * W + x];
+    T fltRadius = metal::fabs(fltDefocus);
+
+    for (int intDeltaY = -int(fltRadius) - 1; intDeltaY <= int(fltRadius) + 1; ++intDeltaY) {
+        for (int intDeltaX = -int(fltRadius) - 1; intDeltaX <= int(fltRadius) + 1; ++intDeltaX) {
+            int intNeighborY = y + intDeltaY;
+            int intNeighborX = x + intDeltaX;
+
+            if ((intNeighborY >= 0) && (intNeighborY < H) && (intNeighborX >= 0) && (intNeighborX < W)) {
+                T fltDist = metal::sqrt(T(intDeltaY) * T(intDeltaY) + T(intDeltaX) * T(intDeltaX));
+                T fltWeight = (0.5 + 0.5 * metal::tanh(4 * (fltRadius - fltDist))) / (fltRadius * fltRadius + 0.2);
+
+                if (fltRadius >= fltDist) {
+                    atomic_fetch_max_explicit(&defocusDilateMax[intNeighborY * W + intNeighborX], int(fltDefocus), memory_order_relaxed);
                 }
+
+                atomic_fetch_add_explicit(&weightCum[W * intNeighborY + intNeighborX], fltWeight, memory_order_relaxed);
+                atomic_fetch_add_explicit(&bokehCum[n * C * W * H + 0 * W * H + intNeighborY * W + intNeighborX], fltWeight * image[n * C * W * H + 0 * W * H + y * W + x], memory_order_relaxed);
+                atomic_fetch_add_explicit(&bokehCum[n * C * W * H + 1 * W * H + intNeighborY * W + intNeighborX], fltWeight * image[n * C * W * H + 1 * W * H + y * W + x], memory_order_relaxed);
+                atomic_fetch_add_explicit(&bokehCum[n * C * W * H + 2 * W * H + intNeighborY * W + intNeighborX], fltWeight * image[n * C * W * H + 2 * W * H + y * W + x], memory_order_relaxed);
             }
         }
     }
+    """
 
-'''
+    kernel = mx.fast.metal_kernel(
+        name="render",
+        input_names=[
+            "image",    # original image
+            "defocus",  # signed defocus map
+        ],
+        output_names=[
+            "defocusDilateMax", # signed defocus map after dilating
+            "bokehCum",         # cumulative bokeh image
+            "weightCum",        # cumulative weight map
+        ],
+        source=source,
+        atomic_outputs=True,
+    )
 
+    imageMx = mx.array(imageMx)
+    defocusMx = mx.array(defocus)
 
-def cupy_kernel(strFunction, objVariables):
-    strKernel = globals()[strFunction]
+    outputs = kernel(
+        inputs=[imageMx, defocusMx],
+        output_shapes=[defocusMx.shape, imageMx.shape, defocusMx.shape],
+        output_dtypes=[mx.int32, imageMx.dtype, defocusMx.dtype],
+        grid=(np.prod(imageMx.shape), 1, 1),
+        threadgroup=(256, 1, 1),
+        template=[("T", mx.float32)],
+        init_value=0,
+    )
 
-    while True:
-        objMatch = re.search('(SIZE_)([0-4])(\()([^\)]*)(\))', strKernel)
+    defocusDilateMax = np.array(outputs[0], copy=False)
+    defocusDilate = torch.from_numpy(np.maximum(defocus, defocusDilateMax)).int()
 
-        if objMatch is None:
-            break
-        # end
+    bokehCum = torch.from_numpy(np.array(outputs[1], copy=False))
+    weightCum = torch.from_numpy(np.array(outputs[2], copy=False))
 
-        intArg = int(objMatch.group(2))
-
-        strTensor = objMatch.group(4)
-        intSizes = objVariables[strTensor].size()
-
-        strKernel = strKernel.replace(objMatch.group(), str(intSizes[intArg]))
-    # end
-
-    while True:
-        objMatch = re.search('(OFFSET_)([0-4])(\()([^\)]+)(\))', strKernel)
-
-        if objMatch is None:
-            break
-        # end
-
-        intArgs = int(objMatch.group(2))
-        strArgs = objMatch.group(4).split(',')
-
-        strTensor = strArgs[0]
-        intStrides = objVariables[strTensor].stride()
-        strIndex = ['((' + strArgs[intArg + 1].replace('{', '(').replace('}', ')').strip() + ')*' + str(
-            intStrides[intArg]) + ')' for intArg in range(intArgs)]
-
-        strKernel = strKernel.replace(objMatch.group(0), '(' + str.join('+', strIndex) + ')')
-    # end
-
-    while True:
-        objMatch = re.search('(VALUE_)([0-4])(\()([^\)]+)(\))', strKernel)
-
-        if objMatch is None:
-            break
-        # end
-
-        intArgs = int(objMatch.group(2))
-        strArgs = objMatch.group(4).split(',')
-
-        strTensor = strArgs[0]
-        intStrides = objVariables[strTensor].stride()
-        strIndex = ['((' + strArgs[intArg + 1].replace('{', '(').replace('}', ')').strip() + ')*' + str(
-            intStrides[intArg]) + ')' for intArg in range(intArgs)]
-
-        strKernel = strKernel.replace(objMatch.group(0), strTensor + '[' + str.join('+', strIndex) + ']')
-    # end
-
-    return strKernel
-# end
-
-
-# @cupy.util.memoize(for_each_device=True)
-@cupy.memoize(for_each_device=True)
-def cupy_launch(strFunction, strKernel):
-    return cupy.cuda.compile_with_cache(strKernel).get_function(strFunction)
-# end
+    return defocusDilate, bokehCum, weightCum
 
 
 class _FunctionRender(torch.autograd.Function):
@@ -122,37 +96,13 @@ class _FunctionRender(torch.autograd.Function):
     def forward(self, image, defocus):
         # self.save_for_backward(image, defocus)
 
-        defocus_dilate = defocus.int()
-        bokeh_cum = torch.zeros_like(image)
-        weight_cum = torch.zeros_like(defocus)
-
-        if defocus.is_cuda == True:
-            n = weight_cum.nelement()
-            cupy_launch('kernel_Render_updateOutput', cupy_kernel('kernel_Render_updateOutput', {
-                'image': image,
-                'defocus': defocus,
-                'defocusDilate': defocus_dilate,
-                'bokehCum': bokeh_cum,
-                'weightCum': weight_cum
-            }))(
-                grid=tuple([int((n + 512 - 1) / 512), 1, 1]),
-                block=tuple([512, 1, 1]),
-                args=[
-                    cupy.int(n),
-                    image.data_ptr(),
-                    defocus.data_ptr(),
-                    defocus_dilate.data_ptr(),
-                    bokeh_cum.data_ptr(),
-                    weight_cum.data_ptr()
-                ]
-            )
-
-        elif defocus.is_cuda == False:
+        if not mx.metal.is_available():
             raise NotImplementedError()
+
+        return render_update_output(image.numpy(), defocus.numpy())
 
         # end
 
-        return defocus_dilate.float(), bokeh_cum, weight_cum
     # end
 
     # @staticmethod

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from neural_renderer import ARNet, IUNet
 
 from classical_renderer.scatter import ModuleRenderScatter  # circular aperture
-from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
+# from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
 
 
 def gaussian_blur(x, r, sigma=None):
@@ -33,7 +33,7 @@ def gaussian_blur(x, r, sigma=None):
 
 
 def pipeline(classical_renderer, arnet, iunet, image, defocus, gamma, args):
-    bokeh_classical, defocus_dilate = classical_renderer(image**gamma, defocus*args.defocus_scale)
+    bokeh_classical, defocus_dilate = classical_renderer(image**gamma, defocus*args.defocus_scale) # bokeh_classical Only depends on K, not defocus_scale
     # bokeh_classical, defocus_dilate = classical_renderer_ex(image**gamma, defocus*args.defocus_scale, poly_sides=6)
 
     bokeh_classical = bokeh_classical ** (1/gamma)
@@ -78,7 +78,7 @@ def pipeline(classical_renderer, arnet, iunet, image, defocus, gamma, args):
 
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('mps' if torch.mps.is_available() else 'cpu')
 
 parser = argparse.ArgumentParser(description='Bokeh Rendering', fromfile_prefix_chars='@')
 
@@ -140,12 +140,9 @@ arnet = ARNet(args.arnet_shuffle_rate, args.arnet_in_channels, args.arnet_out_ch
 iunet = IUNet(args.iunet_shuffle_rate, args.iunet_in_channels, args.iunet_out_channels, args.iunet_middle_channels,
               args.iunet_num_block, args.iunet_share_weight, args.iunet_connect_mode, args.iunet_use_bn, args.iunet_activation)
 
-arnet.cuda()
-iunet.cuda()
-
-checkpoint = torch.load(arnet_checkpoint_path)
+checkpoint = torch.load(arnet_checkpoint_path, map_location=device)
 arnet.load_state_dict(checkpoint['model'])
-checkpoint = torch.load(iunet_checkpoint_path)
+checkpoint = torch.load(iunet_checkpoint_path, map_location=device)
 iunet.load_state_dict(checkpoint['model'])
 
 arnet.eval()
@@ -180,8 +177,6 @@ defocus = K * (disp - disp_focus) / args.defocus_scale
 with torch.no_grad():
     image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
     defocus = torch.from_numpy(defocus).unsqueeze(0).unsqueeze(0)
-    image = image.cuda()
-    defocus = defocus.cuda()
 
     bokeh_pred, bokeh_classical, bokeh_neural, error_map = pipeline(
         classical_renderer, arnet, iunet, image, defocus, gamma, args
